@@ -1,6 +1,6 @@
 # OCI Always Free Ampere A1 — Instance Launcher
 
-Automatically retries launching an OCI **VM.Standard.A1.Flex** (4 OCPU / 24 GB RAM) Always Free instance until capacity is available. Sends real-time notifications to your Telegram.
+Automatically retries launching an OCI **VM.Standard.A1.Flex** (4 OCPU / 24 GB RAM) Always Free instance until capacity is available. Sends real-time Telegram notifications and supports interactive bot commands to monitor and control the script remotely.
 
 > **Auth method:** All credentials are loaded from `.env` — no `~/.oci/config` needed.
 
@@ -10,10 +10,11 @@ Automatically retries launching an OCI **VM.Standard.A1.Flex** (4 OCPU / 24 GB R
 
 1. Reads all config from `.env` on startup
 2. Validates OCI credentials and Telegram bot
-3. Enters an infinite retry loop calling the OCI LaunchInstance API
-4. On **"Out of host capacity"** → waits and retries automatically
-5. On **success** → sends you a Telegram alert with full instance details and exits
-6. On **fatal errors** (bad credentials, wrong OCIDs) → alerts you on Telegram and stops immediately
+3. Starts a background thread that listens for Telegram bot commands
+4. Enters an infinite retry loop calling the OCI LaunchInstance API
+5. On **"Out of host capacity"** → waits and retries automatically
+6. On **success** → sends a Telegram alert with full instance details and exits
+7. On **fatal errors** (bad credentials, wrong OCIDs) → alerts on Telegram and stops immediately
 
 ---
 
@@ -250,7 +251,50 @@ crontab -e
 
 Add this line:
 ```
-@reboot sleep 15 && tmux new-session -d -s oci -c /path/to/your/script 'python launch_free_instance.py'
+@reboot sleep 15 && tmux new-session -d -s oci -c /path/to/your/script 'python main.py'
+```
+
+---
+
+## Telegram Bot Commands
+
+Once the script is running, send these commands directly to your bot in Telegram:
+
+| Command | Description |
+|---|---|
+| `/start` | Show welcome message and full command list |
+| `/status` | Live attempt count, uptime, current state, last error |
+| `/config` | Show current OCI region, AD, shape, OCPU, RAM, retry interval |
+| `/log` | Last 10 live log lines sent directly to Telegram |
+| `/pause` | Suspend retrying — script stays alive but stops calling OCI |
+| `/resume` | Resume retrying after a pause |
+| `/stop` | Gracefully shut down the entire script |
+| `/ping` | Instant reply confirming bot is alive + current uptime |
+
+### How commands work internally
+
+Two threads run simultaneously:
+
+```
+Main thread        → OCI retry loop (launch attempts)
+Background thread  → Telegram polling (listens for your commands)
+```
+
+They share a live `state` object so commands like `/pause` and `/stop` take effect on the very next loop iteration — no delay, no conflict.
+
+> **Security:** The bot only responds to your `TELEGRAM_CHAT_ID`. Messages from any other chat are silently ignored and logged.
+
+### Example `/status` reply
+
+```
+📊 Status
+━━━━━━━━━━━━━━━━━━━━
+🔁 State       : 🔄 RUNNING
+🔢 Attempts    : 143
+⏱ Uptime      : 2h 23m 11s
+🕐 Last try    : 14:32:07
+⚠️ Last error  : Out of host capacity
+🔁 Retry every : 60s
 ```
 
 ---
@@ -313,3 +357,4 @@ cat launch_instance.log       # view full log
 - **Try all 3 Availability Domains** if one is always out of capacity. Change `AD-1` to `AD-2` or `AD-3` in `OCI_AVAILABILITY_DOMAIN` and run parallel sessions in separate tmux windows.
 - **Don't set `RETRY_INTERVAL_SECONDS` below 60** — OCI may rate-limit your account.
 - **Verify your Telegram token** anytime by visiting: `https://api.telegram.org/botYOUR_TOKEN/getMe`
+- **Use `/pause`** if you want to stop retrying temporarily without killing the script (e.g. OCI maintenance windows).

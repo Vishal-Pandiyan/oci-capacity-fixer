@@ -13,12 +13,23 @@ import os
 import sys
 import logging
 import requests
+import threading
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 # ── Load .env ──────────────────────────────────────────────────────────────────
 load_dotenv()
 
 # ── Logging ────────────────────────────────────────────────────────────────────
+log_lines = []   # in-memory buffer for /log command (last 50 lines)
+
+class BufferHandler(logging.Handler):
+    def emit(self, record):
+        msg = self.format(record)
+        log_lines.append(msg)
+        if len(log_lines) > 50:
+            log_lines.pop(0)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -26,6 +37,7 @@ logging.basicConfig(
     handlers=[
         logging.StreamHandler(sys.stdout),
         logging.FileHandler("launch_instance.log"),
+        BufferHandler(),
     ],
 )
 log = logging.getLogger(__name__)
@@ -40,7 +52,7 @@ def get_env(key: str) -> str:
     return value
 
 
-# ── OCI Auth (from .env — no ~/.oci/config needed) ────────────────────────────
+# ── OCI Auth (from .env) ───────────────────────────────────────────────────────
 OCI_USER_OCID        = get_env("OCI_USER_OCID")
 OCI_TENANCY_OCID     = get_env("OCI_TENANCY_OCID")
 OCI_FINGERPRINT      = get_env("OCI_FINGERPRINT")
@@ -61,7 +73,7 @@ BOOT_VOLUME_GB       = int(os.getenv("OCI_BOOT_VOLUME_GB", "50"))
 
 INSTANCE_NAME        = os.getenv("INSTANCE_DISPLAY_NAME",      "free-ampere-instance")
 RETRY_INTERVAL       = int(os.getenv("RETRY_INTERVAL_SECONDS", "60"))
-MAX_RETRIES          = int(os.getenv("MAX_RETRIES",             "0"))  # 0 = infinite
+MAX_RETRIES          = int(os.getenv("MAX_RETRIES",             "0"))
 
 # ── Telegram Config ────────────────────────────────────────────────────────────
 TG_BOT_TOKEN         = get_env("TELEGRAM_BOT_TOKEN")
@@ -70,41 +82,230 @@ TG_NOTIFY_EVERY      = int(os.getenv("TELEGRAM_NOTIFY_EVERY_N_ATTEMPTS", "10"))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TELEGRAM
+# SHARED STATE  (read/written by both launcher + bot threads)
+# ══════════════════════════════════════════════════════════════════════════════
+
+state = {
+    "attempt":      0,
+    "paused":       False,
+    "stop":         False,
+    "last_error":   "None",
+    "start_time":   datetime.now(),
+    "last_attempt_time": None,
+}
+state_lock = threading.Lock()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TELEGRAM — SEND
 # ══════════════════════════════════════════════════════════════════════════════
 
 def tg_send(message: str, silent: bool = False) -> None:
-    """Send a Telegram message. Fails silently to never break the main loop."""
+    """Send a Telegram message. Never raises — failures are logged only."""
     try:
         url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
         payload = {
-            "chat_id":    TG_CHAT_ID,
-            "text":       message,
-            "parse_mode": "HTML",
+            "chat_id":              TG_CHAT_ID,
+            "text":                 message,
+            "parse_mode":           "HTML",
             "disable_notification": silent,
         }
         resp = requests.post(url, json=payload, timeout=10)
         if not resp.ok:
-            log.warning(f"Telegram send failed: {resp.status_code} {resp.text}")
+            log.warning(f"Telegram send failed: {resp.status_code} {resp.text[:100]}")
     except Exception as e:
         log.warning(f"Telegram error (non-fatal): {e}")
 
 
 def tg_test() -> bool:
-    """Verify Telegram credentials on startup. Returns True if OK."""
+    """Verify Telegram token on startup."""
     try:
-        url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/getMe"
-        resp = requests.get(url, timeout=10)
+        resp = requests.get(
+            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/getMe", timeout=10
+        )
         if resp.ok:
             bot_name = resp.json().get("result", {}).get("username", "unknown")
             log.info(f"Telegram bot verified: @{bot_name}")
             return True
-        else:
-            log.warning(f"Telegram bot check failed: {resp.status_code}")
-            return False
+        log.warning(f"Telegram bot check failed: {resp.status_code}")
+        return False
     except Exception as e:
         log.warning(f"Telegram bot check error: {e}")
         return False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TELEGRAM — COMMAND HANDLERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def fmt_uptime() -> str:
+    delta = datetime.now() - state["start_time"]
+    h, rem = divmod(int(delta.total_seconds()), 3600)
+    m, s   = divmod(rem, 60)
+    return f"{h}h {m}m {s}s"
+
+
+def handle_start(_):
+    tg_send(
+        "👋 <b>OCI Instance Launcher Bot</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Available commands:\n\n"
+        "📊 /status  — Live attempt count &amp; uptime\n"
+        "⚙️ /config  — Current OCI &amp; shape settings\n"
+        "📋 /log     — Last 10 log lines\n"
+        "⏸ /pause   — Pause retrying\n"
+        "▶️ /resume  — Resume after pause\n"
+        "🛑 /stop    — Stop the script\n"
+        "🏓 /ping    — Check bot is alive"
+    )
+
+
+def handle_status(_):
+    with state_lock:
+        attempt      = state["attempt"]
+        paused       = state["paused"]
+        last_error   = state["last_error"]
+        last_time    = state["last_attempt_time"]
+
+    status_icon  = "⏸ PAUSED" if paused else "🔄 RUNNING"
+    last_str     = last_time.strftime("%H:%M:%S") if last_time else "—"
+
+    tg_send(
+        f"📊 <b>Status</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔁 State       : <b>{status_icon}</b>\n"
+        f"🔢 Attempts    : <b>{attempt}</b>\n"
+        f"⏱ Uptime      : <code>{fmt_uptime()}</code>\n"
+        f"🕐 Last try    : <code>{last_str}</code>\n"
+        f"⚠️ Last error  : <code>{last_error}</code>\n"
+        f"🔁 Retry every : <code>{RETRY_INTERVAL}s</code>"
+    )
+
+
+def handle_config(_):
+    tg_send(
+        f"⚙️ <b>Current Config</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🌍 Region      : <code>{OCI_REGION}</code>\n"
+        f"📍 AD          : <code>{AVAILABILITY_DOMAIN}</code>\n"
+        f"🖥 Shape       : <code>{SHAPE}</code>\n"
+        f"⚙️ OCPUs       : <code>{OCPUS}</code>\n"
+        f"🧠 Memory      : <code>{MEMORY_GB} GB</code>\n"
+        f"💾 Boot Vol    : <code>{BOOT_VOLUME_GB} GB</code>\n"
+        f"📛 Name        : <code>{INSTANCE_NAME}</code>\n"
+        f"🔁 Interval    : <code>{RETRY_INTERVAL}s</code>\n"
+        f"🔔 Notify every: <code>{TG_NOTIFY_EVERY} attempts</code>"
+    )
+
+
+def handle_log(_):
+    last_lines = log_lines[-10:] if len(log_lines) >= 10 else log_lines
+    if not last_lines:
+        tg_send("📋 No log lines yet.")
+        return
+    log_text = "\n".join(last_lines)
+    tg_send(f"📋 <b>Last {len(last_lines)} log lines:</b>\n<pre>{log_text}</pre>")
+
+
+def handle_pause(_):
+    with state_lock:
+        if state["paused"]:
+            tg_send("⏸ Already paused. Use /resume to continue.")
+            return
+        state["paused"] = True
+    log.info("Bot command: PAUSE received")
+    tg_send("⏸ <b>Paused.</b> Retrying is suspended.\nUse /resume to continue.")
+
+
+def handle_resume(_):
+    with state_lock:
+        if not state["paused"]:
+            tg_send("▶️ Already running. Use /pause to pause.")
+            return
+        state["paused"] = False
+    log.info("Bot command: RESUME received")
+    tg_send("▶️ <b>Resumed.</b> Retrying has restarted.")
+
+
+def handle_stop(_):
+    tg_send("🛑 <b>Stop command received.</b>\nShutting down the launcher...")
+    log.info("Bot command: STOP received — shutting down")
+    with state_lock:
+        state["stop"] = True
+
+
+def handle_ping(_):
+    tg_send(f"🏓 <b>Pong!</b>  Bot is alive.\nUptime: <code>{fmt_uptime()}</code>")
+
+
+# Map command text → handler function
+COMMANDS = {
+    "/start":  handle_start,
+    "/status": handle_status,
+    "/config": handle_config,
+    "/log":    handle_log,
+    "/pause":  handle_pause,
+    "/resume": handle_resume,
+    "/stop":   handle_stop,
+    "/ping":   handle_ping,
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TELEGRAM — POLLING THREAD
+# ══════════════════════════════════════════════════════════════════════════════
+
+def bot_polling_thread():
+    """
+    Runs in a background thread.
+    Polls Telegram for new messages and dispatches commands.
+    Only accepts messages from TG_CHAT_ID for security.
+    """
+    offset = None
+    log.info("Telegram bot polling started.")
+
+    while True:
+        with state_lock:
+            if state["stop"]:
+                break
+        try:
+            params = {"timeout": 20, "allowed_updates": ["message"]}
+            if offset:
+                params["offset"] = offset
+
+            resp = requests.get(
+                f"https://api.telegram.org/bot{TG_BOT_TOKEN}/getUpdates",
+                params=params,
+                timeout=25,
+            )
+            if not resp.ok:
+                time.sleep(5)
+                continue
+
+            updates = resp.json().get("result", [])
+            for update in updates:
+                offset = update["update_id"] + 1
+                msg    = update.get("message", {})
+                chat   = str(msg.get("chat", {}).get("id", ""))
+                text   = msg.get("text", "").strip().lower().split("@")[0]
+
+                # Security: ignore messages from other chats
+                if chat != str(TG_CHAT_ID):
+                    log.warning(f"Ignored message from unauthorized chat: {chat}")
+                    continue
+
+                if text in COMMANDS:
+                    log.info(f"Bot command received: {text}")
+                    COMMANDS[text](msg)
+                elif text:
+                    tg_send(
+                        f"❓ Unknown command: <code>{text}</code>\n"
+                        "Use /start to see available commands."
+                    )
+
+        except Exception as e:
+            log.warning(f"Bot polling error (non-fatal): {e}")
+            time.sleep(5)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -176,8 +377,11 @@ def main():
     log.info(f"  Telegram    : notify every {TG_NOTIFY_EVERY} attempts")
     log.info("=" * 60)
 
-    # Validate Telegram
+    # Validate Telegram + start polling thread
     tg_ok = tg_test()
+    if tg_ok:
+        poller = threading.Thread(target=bot_polling_thread, daemon=True)
+        poller.start()
 
     # Validate OCI config
     config = build_oci_config()
@@ -196,19 +400,38 @@ def main():
         tg_send(
             f"🚀 <b>OCI Launcher Started</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🖥 Shape: <code>{SHAPE}</code>\n"
-            f"⚙️ OCPUs: <code>{OCPUS}</code>  RAM: <code>{MEMORY_GB} GB</code>\n"
-            f"🌍 Region: <code>{OCI_REGION}</code>\n"
-            f"📍 AD: <code>{AVAILABILITY_DOMAIN}</code>\n"
+            f"🖥 Shape  : <code>{SHAPE}</code>\n"
+            f"⚙️ OCPUs  : <code>{OCPUS}</code>  RAM: <code>{MEMORY_GB} GB</code>\n"
+            f"🌍 Region : <code>{OCI_REGION}</code>\n"
+            f"📍 AD     : <code>{AVAILABILITY_DOMAIN}</code>\n"
             f"🔁 Retry every <code>{RETRY_INTERVAL}s</code>\n"
-            f"⏳ Waiting for capacity...",
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💬 Send /start to see bot commands.",
             silent=True,
         )
 
     attempt = 0
 
     while True:
+        # Check stop flag
+        with state_lock:
+            if state["stop"]:
+                log.info("Stop flag set — exiting.")
+                break
+
+        # Check pause flag
+        with state_lock:
+            is_paused = state["paused"]
+        if is_paused:
+            log.info("Paused — waiting...")
+            time.sleep(5)
+            continue
+
         attempt += 1
+        with state_lock:
+            state["attempt"]           = attempt
+            state["last_attempt_time"] = datetime.now()
+
         log.info(f"[Attempt {attempt}] Requesting instance...")
 
         try:
@@ -228,39 +451,45 @@ def main():
             tg_send(
                 f"✅ <b>Instance Launched!</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🆔 ID: <code>{instance.id}</code>\n"
-                f"📛 Name: <code>{instance.display_name}</code>\n"
-                f"📊 State: <code>{instance.lifecycle_state}</code>\n"
+                f"🆔 ID    : <code>{instance.id}</code>\n"
+                f"📛 Name  : <code>{instance.display_name}</code>\n"
+                f"📊 State : <code>{instance.lifecycle_state}</code>\n"
                 f"🌍 Region: <code>{instance.region}</code>\n"
-                f"🖥 Shape: <code>{instance.shape}</code>\n"
+                f"🖥 Shape : <code>{instance.shape}</code>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"🎉 Done after <b>{attempt}</b> attempt(s)!\n"
-                f"⏱ Allow 1-2 min to reach RUNNING state."
+                f"⏱ Uptime: <code>{fmt_uptime()}</code>\n"
+                f"Allow 1-2 min to reach RUNNING state."
             )
+            with state_lock:
+                state["stop"] = True
             break
 
         except oci.exceptions.ServiceError as e:
             if e.status == 500 and "Out of host capacity" in str(e.message):
+                with state_lock:
+                    state["last_error"] = "Out of host capacity"
                 log.warning(f"[Attempt {attempt}] Out of capacity — retrying in {RETRY_INTERVAL}s...")
-                # Notify every N attempts
                 if attempt % TG_NOTIFY_EVERY == 0:
                     tg_send(
                         f"⏳ <b>Still trying...</b>\n"
                         f"Attempt <b>{attempt}</b> — out of capacity.\n"
-                        f"Retrying every <code>{RETRY_INTERVAL}s</code>.",
+                        f"Uptime: <code>{fmt_uptime()}</code>\n"
+                        f"Use /status for details.",
                         silent=True,
                     )
 
             elif e.status == 429:
                 backoff = RETRY_INTERVAL * 2
-                log.warning(f"[Attempt {attempt}] Rate limited (429) — backing off {backoff}s...")
+                with state_lock:
+                    state["last_error"] = "Rate limited (429)"
+                log.warning(f"[Attempt {attempt}] Rate limited — backing off {backoff}s...")
                 tg_send(f"⚠️ Rate limited (429) at attempt {attempt}. Backing off {backoff}s.", silent=True)
                 time.sleep(backoff)
                 continue
 
             elif e.status == 400:
-                msg = f"Bad request — check your .env values:\n{e.message}"
-                log.error(f"[Attempt {attempt}] {msg}")
+                log.error(f"[Attempt {attempt}] Bad request: {e.message}")
                 tg_send(f"❌ <b>Fatal: Bad Request (400)</b>\n<code>{e.message}</code>")
                 sys.exit(1)
 
@@ -270,19 +499,23 @@ def main():
                 sys.exit(1)
 
             elif e.status == 404:
-                log.error(f"[Attempt {attempt}] Resource not found — check OCIDs in .env:\n{e.message}")
+                log.error(f"[Attempt {attempt}] Resource not found: {e.message}")
                 tg_send(f"❌ <b>Fatal: Resource Not Found (404)</b>\n<code>{e.message}</code>")
                 sys.exit(1)
 
             elif "LimitExceeded" in str(e.code):
-                log.error(f"[Attempt {attempt}] Limit exceeded — already have a free instance?")
+                log.error(f"[Attempt {attempt}] Limit exceeded.")
                 tg_send("❌ <b>Fatal: Limit Exceeded</b>\nYou may already have a free A1 instance.")
                 sys.exit(1)
 
             else:
+                with state_lock:
+                    state["last_error"] = f"API {e.status}: {e.message[:60]}"
                 log.warning(f"[Attempt {attempt}] API error ({e.status}): {e.message}")
 
         except Exception as e:
+            with state_lock:
+                state["last_error"] = str(e)[:80]
             log.warning(f"[Attempt {attempt}] Unexpected error: {e}")
 
         if MAX_RETRIES > 0 and attempt >= MAX_RETRIES:
