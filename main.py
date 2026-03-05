@@ -261,8 +261,30 @@ def bot_polling_thread():
     Polls Telegram for new messages and dispatches commands.
     Only accepts messages from TG_CHAT_ID for security.
     """
-    offset = None
     log.info("Telegram bot polling started.")
+
+    # ── Skip all pending/old updates on startup ────────────────────────────────
+    # Without this, old commands (like /stop) sitting in Telegram's queue
+    # would be replayed every time the script restarts, causing instant shutdown.
+    try:
+        resp = requests.get(
+            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/getUpdates",
+            params={"offset": -1},   # fetch only the very last update
+            timeout=10,
+        )
+        if resp.ok:
+            results = resp.json().get("result", [])
+            if results:
+                # Set offset ahead of all existing updates so none get processed
+                offset = results[-1]["update_id"] + 1
+                log.info(f"Skipped {len(results)} pending Telegram update(s) from previous session.")
+            else:
+                offset = None
+        else:
+            offset = None
+    except Exception as e:
+        log.warning(f"Could not flush old Telegram updates (non-fatal): {e}")
+        offset = None
 
     while True:
         with state_lock:
@@ -524,7 +546,11 @@ def main():
             sys.exit(1)
 
         log.info(f"Waiting {RETRY_INTERVAL}s...")
-        time.sleep(RETRY_INTERVAL)
+        try:
+            time.sleep(RETRY_INTERVAL)
+        except KeyboardInterrupt:
+            log.info("Keyboard interrupt received — exiting cleanly.")
+            sys.exit(0)
 
 
 if __name__ == "__main__":
