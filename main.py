@@ -591,8 +591,9 @@ def validate_oci_values(config: dict) -> bool:
 
     try:
         # ── 3. Availability Domain — check it exists in this region ───────────
-        compute_client = oci.core.ComputeClient(config)
-        ads = compute_client.list_availability_domains(COMPARTMENT_OCID).data
+        # list_availability_domains belongs to IdentityClient, not ComputeClient
+        identity_client_ad = oci.identity.IdentityClient(config)
+        ads      = identity_client_ad.list_availability_domains(COMPARTMENT_OCID).data
         ad_names = [ad.name for ad in ads]
         if AVAILABILITY_DOMAIN not in ad_names:
             errors.append(
@@ -625,14 +626,16 @@ def validate_oci_values(config: dict) -> bool:
         # ── 5. Image ──────────────────────────────────────────────────────────
         compute_client = oci.core.ComputeClient(config)
         image          = compute_client.get_image(IMAGE_OCID).data
-        # Warn if image architecture is not aarch64 (wrong arch for A1)
-        if image.architecture and image.architecture.lower() != "aarch64":
+        # OCI SDK Image model has no .architecture field — check operating_system
+        # to warn if it looks like a non-ARM image (x86_64 OS names contain "x86")
+        os_name = (image.operating_system or "").lower()
+        if "x86" in os_name:
             errors.append(
-                f"Image '{image.display_name}' architecture is '{image.architecture}', "
-                "expected 'aarch64' for VM.Standard.A1.Flex."
+                f"Image '{image.display_name}' appears to be x86-based (OS: {image.operating_system}). "
+                "VM.Standard.A1.Flex requires an aarch64 image."
             )
         else:
-            log.info(f"  ✅ Image OCID ({image.display_name})")
+            log.info(f"  ✅ Image OCID ({image.display_name} — {image.operating_system} {image.operating_system_version})")
     except oci.exceptions.ServiceError as e:
         errors.append(f"Image invalid ({e.status}): {e.message}")
     except Exception as e:
